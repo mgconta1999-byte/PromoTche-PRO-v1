@@ -12,7 +12,7 @@ app.use(express.json({ limit: '15mb' }));
 app.use('/cards', express.static(path.join(__dirname, '..', 'generated', 'cards')));
 
 app.get('/', (req, res) => {
-  res.json({ ok: true, app: 'PromoTche PRO v2', rota: 'POST /api/gerar-card' });
+  res.json({ ok: true, app: 'PromoTche PRO v3', rota: 'POST /api/gerar-card' });
 });
 
 app.post('/api/gerar-card', async (req, res) => {
@@ -26,5 +26,5 @@ app.post('/api/gerar-card', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PromoTche PRO v2 rodando em http://localhost:${PORT}`);
+  console.log(`PromoTche PRO v3 rodando em ${BASE_URL}`);
 });
