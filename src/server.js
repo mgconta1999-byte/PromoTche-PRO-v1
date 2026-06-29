@@ -9,7 +9,7 @@ const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\
 
 app.use(cors());
 app.use(express.json({ limit: '15mb' }));
-app.use('/cards', express.static(path.join(__dirname, 'generated', 'cards')));
+app.use('/cards', express.static(path.join(__dirname, '..', 'generated', 'cards')));
 
 app.get('/', (req, res) => {
   res.json({ ok: true, app: 'PromoTche PRO v2', rota: 'POST /api/gerar-card' });
