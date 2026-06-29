@@ -3,58 +3,97 @@ const path = require('path');
 const axios = require('axios');
 const sharp = require('sharp');
 
-const W = 1080;
-const H = 1350;
+const WIDTH = 1080;
+const HEIGHT = 1350;
 
-function limpar(v) {
-  return String(v ?? '').replace(/^=/, '').trim();
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&apos;' }[m]));
 }
 
-function normalizarCategoria(v) {
-  const c = limpar(v).toLowerCase();
-  if (!c || c === 'generico' || c === 'genérico') return 'OFERTA';
-  if (c.includes('cel')) return 'CELULAR';
-  if (c.includes('smart')) return 'CELULAR';
-  if (c.includes('tv')) return 'TV';
-  if (c.includes('gel')) return 'GELADEIRA';
-  if (c.includes('note')) return 'NOTEBOOK';
-  if (c.includes('mov') || c.includes('móv') || c.includes('arm')) return 'MÓVEIS';
-  if (c.includes('eletro')) return 'ELETRO';
-  return c.toUpperCase();
+function normalizarTexto(v) {
+  return String(v ?? '').trim();
 }
 
-function numero(v) {
-  let s = limpar(v).replace(/R\$/gi, '').replace(/\s/g, '');
-  if (!s) return 0;
+function limparUrl(url) {
+  return normalizarTexto(url).replace(/^['"]+|['"]+$/g, '').trim();
+}
+
+function slug(texto) {
+  return normalizarTexto(texto)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 80) || 'produto';
+}
+
+function moeda(valor) {
+  if (valor === null || valor === undefined || valor === '') return '';
+  if (typeof valor === 'number') {
+    return valor.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+  }
+  let s = String(valor).trim().replace(/R\$/gi, '').replace(/\s/g, '');
+  if (s.includes(',') && s.includes('.')) s = s.replace(/\./g, '').replace(',', '.');
+  else if (s.includes(',')) s = s.replace(',', '.');
+  const n = Number(s);
+  if (!Number.isFinite(n)) return String(valor);
+  return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+}
+
+function numero(valor) {
+  if (typeof valor === 'number') return valor;
+  let s = String(valor ?? '').replace(/R\$/gi, '').replace(/\s/g, '');
   if (s.includes(',') && s.includes('.')) s = s.replace(/\./g, '').replace(',', '.');
   else if (s.includes(',')) s = s.replace(',', '.');
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
 
-function moeda(v) {
-  const n = typeof v === 'number' ? v : numero(v);
-  if (!n) return limpar(v) || 'R$ 0,00';
-  return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+function economia(precoAntigo, precoAtual) {
+  const e = numero(precoAntigo) - numero(precoAtual);
+  return e > 0 ? moeda(e) : '';
 }
 
-function esc(s) {
-  return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+function descontoTexto(v) {
+  const n = Math.round(numero(v));
+  return n > 0 ? String(n) : '';
 }
 
-function slug(s) {
-  return limpar(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'card';
+function categoriaTexto(cat) {
+  const c = normalizarTexto(cat).toLowerCase();
+  if (!c) return 'OFERTA';
+  if (c.includes('cel') || c.includes('smart')) return 'CELULAR';
+  if (c.includes('tv') || c.includes('tele')) return 'TV';
+  if (c.includes('note') || c.includes('lap')) return 'NOTEBOOK';
+  if (c.includes('geladeira') || c.includes('refriger')) return 'GELADEIRA';
+  if (c.includes('move') || c.includes('móvel') || c.includes('arm')) return 'MÓVEIS';
+  if (c.includes('ferrament')) return 'FERRAMENTA';
+  return normalizarTexto(cat).toUpperCase().slice(0, 14);
 }
 
-function quebrarTexto(texto, maxPorLinha = 17, maxLinhas = 3) {
-  const palavras = limpar(texto).split(/\s+/).filter(Boolean);
+function tituloPrincipal(dados) {
+  const t = normalizarTexto(dados.tituloCard || dados.TituloCard || dados.produto || dados.Produto);
+  let limpo = t
+    .replace(/^celular\s+/i, '')
+    .replace(/^smartphone\s+/i, '')
+    .replace(/\bcom\s+ia\b/gi, '')
+    .replace(/,.*$/g, '')
+    .trim();
+  const marca = normalizarTexto(dados.marca || dados.Marca);
+  if (marca) limpo = limpo.replace(new RegExp('^' + marca, 'i'), '').trim();
+  return limpo || t || 'Oferta Especial';
+}
+
+function quebrar(texto, maxPorLinha = 18, maxLinhas = 3) {
+  const palavras = normalizarTexto(texto).split(/\s+/).filter(Boolean);
   const linhas = [];
   let atual = '';
   for (const p of palavras) {
     const teste = atual ? `${atual} ${p}` : p;
-    if (teste.length <= maxPorLinha) atual = teste;
+    if (teste.length <= maxPorLinha || !atual) atual = teste;
     else {
-      if (atual) linhas.push(atual);
+      linhas.push(atual);
       atual = p;
     }
     if (linhas.length === maxLinhas) break;
@@ -64,151 +103,216 @@ function quebrarTexto(texto, maxPorLinha = 17, maxLinhas = 3) {
   return linhas;
 }
 
-function extrairSpecs(dados) {
-  const texto = `${limpar(dados.tituloCard)} ${limpar(dados.produto)}`.toLowerCase();
+function textoSpecs(dados) {
+  const produto = normalizarTexto(dados.produto || dados.Produto || dados.tituloCard || dados.TituloCard);
   const specs = [];
-  const camera = texto.match(/(\d{2,3})\s*mp/);
-  const ram = texto.match(/(\d{1,2})\s*gb\s*ram/);
-  const armazenamento = texto.match(/(\d{2,4})\s*gb/) || texto.match(/(\d)\s*tb/);
-  const tela = texto.match(/(\d[\.,]\d)\s*("|pol|polegadas)/);
-  if (camera) specs.push(`Câmera de ${camera[1]}MP`);
-  if (ram && armazenamento) specs.push(`${ram[1]}GB RAM • ${armazenamento[1]}GB`);
-  else if (ram) specs.push(`${ram[1]}GB RAM`);
-  else if (armazenamento) specs.push(`${armazenamento[1]}GB`);
-  if (tela) specs.push(`Tela ${tela[1].replace('.', ',')}”`);
-  if (!specs.length) specs.push('Oferta por tempo limitado');
-  return specs.slice(0, 3);
+  const camera = produto.match(/(\d+\s?mp)/i);
+  const ram = produto.match(/(\d+\s?gb)\s*ram/i) || produto.match(/ram\s*(\d+\s?gb)/i);
+  const arm = produto.match(/(\d+\s?gb|\d+\s?tb)(?=\s|,|$)/ig);
+  if (camera) specs.push(`Câmera de ${camera[1].toUpperCase().replace(/\s/g, '')}`);
+  if (ram) {
+    const r = (ram[1] || ram[0]).replace(/ram/i, '').trim().toUpperCase().replace(/\s/g, '');
+    let armazenamento = '';
+    if (arm && arm.length) armazenamento = arm[arm.length - 1].toUpperCase().replace(/\s/g, '');
+    specs.push(`${r} RAM${armazenamento ? ' • ' + armazenamento : ''}`);
+  }
+  if (!specs.length) specs.push('Oferta selecionada');
+  if (specs.length === 1) specs.push('Confira no link da bio');
+  return specs.slice(0, 2);
 }
 
-async function baixarImagem(url) {
-  const u = limpar(url);
-  if (!u || !/^https?:\/\//i.test(u)) throw new Error(`ImagemProduto inválida: ${u}`);
-  const r = await axios.get(u, {
+async function baixar(url) {
+  const limpa = limparUrl(url);
+  if (!limpa || !/^https?:\/\//i.test(limpa)) throw new Error('URL da imagem inválida');
+  const r = await axios.get(limpa, {
     responseType: 'arraybuffer',
     timeout: 25000,
-    headers: { 'User-Agent': 'Mozilla/5.0 PromoTche/3.0' }
+    headers: { 'User-Agent': 'Mozilla/5.0 PromoTche' },
   });
   return Buffer.from(r.data);
 }
 
-function fitText(text, maxChars, baseSize) {
-  const len = limpar(text).length;
-  if (len <= maxChars) return baseSize;
-  return Math.max(36, Math.floor(baseSize * maxChars / len));
+async function imagemBase64(url) {
+  const buffer = await baixar(url);
+  const png = await sharp(buffer)
+    .resize(420, 520, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 0 } })
+    .png()
+    .toBuffer();
+  return `data:image/png;base64,${png.toString('base64')}`;
 }
 
-function svgTemplate({ categoria, marca, tituloLinhas, specs, precoAntigo, precoAtual, economia, desconto, cupom }) {
-  const tituloSvg = tituloLinhas.map((l, i) => `<text x="70" y="${505 + i * 70}" class="titulo">${esc(l)}</text>`).join('\n');
-  const specsSvg = specs.map((s, i) => `<text x="96" y="${745 + i * 60}" class="spec">${esc(s)}</text><circle cx="75" cy="${733 + i * 60}" r="7" fill="#f4c400"/>`).join('\n');
-  const cupomText = limpar(cupom) || 'CONFIRA NO LINK';
-  const cupomSize = fitText(cupomText, 16, 42);
-  const precoSize = fitText(precoAtual, 11, 72);
+async function logoBase64() {
+  const possibilidades = [
+    path.join(__dirname, '..', 'assets', 'logo-promotche.webp'),
+    path.join(__dirname, '..', 'assets', 'logo.webp'),
+    path.join(__dirname, '..', 'assets', 'logo.png'),
+    path.join(__dirname, 'assets', 'logo-promotche.webp'),
+    path.join(__dirname, 'assets', 'logo.webp'),
+    path.join(__dirname, 'assets', 'logo.png'),
+  ];
+  for (const p of possibilidades) {
+    if (fs.existsSync(p)) {
+      const png = await sharp(p).resize(190, 190, { fit: 'contain' }).png().toBuffer();
+      return `data:image/png;base64,${png.toString('base64')}`;
+    }
+  }
+  return '';
+}
 
-  return `
-<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+function calcFontTitulo(linhas) {
+  const maior = Math.max(...linhas.map(l => l.length), 1);
+  if (maior > 20) return 47;
+  if (maior > 17) return 52;
+  return 58;
+}
+
+function ajustarCupom(cupom) {
+  const c = normalizarTexto(cupom || 'VER OFERTA').toUpperCase();
+  if (c.length > 18) return { texto: c.slice(0, 18), font: 33 };
+  if (c.length > 14) return { texto: c, font: 36 };
+  return { texto: c, font: 40 };
+}
+
+async function gerarCard(dados = {}, baseUrl = '') {
+  const produtoImg = await imagemBase64(dados.imagemProduto || dados.ImagemProduto);
+  const logo = await logoBase64();
+
+  const marca = normalizarTexto(dados.marca || dados.Marca || '').toUpperCase();
+  const titulo = tituloPrincipal(dados).toUpperCase();
+  const linhasTitulo = quebrar(titulo, 16, 3);
+  const fontTitulo = calcFontTitulo(linhasTitulo);
+  const specs = textoSpecs(dados);
+  const precoAtual = moeda(dados.precoAtual || dados.PrecoAtual);
+  const precoAntigo = moeda(dados.precoAntigo || dados.PrecoAntigo);
+  const econ = economia(dados.precoAntigo || dados.PrecoAntigo, dados.precoAtual || dados.PrecoAtual);
+  const desc = descontoTexto(dados.desconto || dados.Desconto);
+  const categoria = categoriaTexto(dados.categoria || dados.Categoria);
+  const cupom = ajustarCupom(dados.cupom || dados.Cupom);
+  const nomeArquivo = `${Date.now()}-${slug(titulo)}.jpg`;
+
+  const tituloSvg = linhasTitulo.map((l, i) => `<text x="70" y="${505 + i * (fontTitulo + 10)}" class="titulo" font-size="${fontTitulo}">${esc(l)}</text>`).join('');
+  const specsSvg = specs.map((s, i) => `
+    <circle cx="78" cy="${780 + i * 54}" r="8" fill="#ffcc00"/>
+    <text x="105" y="${792 + i * 54}" class="spec">${esc(s)}</text>`).join('');
+
+  const logoSvg = logo
+    ? `<image href="${logo}" x="25" y="18" width="190" height="190" preserveAspectRatio="xMidYMid meet"/>`
+    : `<circle cx="115" cy="105" r="82" fill="#050505" stroke="#ffcc00" stroke-width="4"/><text x="115" y="95" text-anchor="middle" class="logoText">PROMO</text><text x="115" y="133" text-anchor="middle" class="logoText yellow">TCHÊ</text>`;
+
+  const svg = `
+<svg width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#070707"/><stop offset="0.58" stop-color="#080808"/><stop offset="1" stop-color="#ffcc00"/></linearGradient>
-    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity="0.35"/></filter>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#050505"/><stop offset="0.72" stop-color="#090909"/><stop offset="1" stop-color="#ffcc00"/>
+    </linearGradient>
+    <linearGradient id="yellow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffd500"/><stop offset="1" stop-color="#ffbe00"/>
+    </linearGradient>
+    <linearGradient id="red" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff1018"/><stop offset="1" stop-color="#d90008"/>
+    </linearGradient>
+    <radialGradient id="green" cx="50%" cy="35%" r="70%">
+      <stop offset="0" stop-color="#32d54d"/><stop offset="1" stop-color="#079a25"/>
+    </radialGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="10" flood-opacity="0.35"/>
+    </filter>
     <style>
-      .font{font-family:Arial, Helvetica, sans-serif;font-weight:900;}
-      .cond{font-family:Arial Narrow, Arial, Helvetica, sans-serif;font-weight:900;}
-      .small{font-family:Arial, Helvetica, sans-serif;font-weight:700;}
-      .titulo{font-family:Arial Narrow, Arial, Helvetica, sans-serif;font-weight:900;font-size:58px;fill:#070707;letter-spacing:-1px;}
-      .spec{font-family:Arial, Helvetica, sans-serif;font-weight:800;font-size:34px;fill:#111;}
+      .font{font-family: Impact, 'Arial Black', Arial, sans-serif; font-weight:900;}
+      .tituloTopo{font-family: Impact, 'Arial Black', Arial, sans-serif; font-size:78px; font-style:italic; font-weight:900; fill:#080808; letter-spacing:1px;}
+      .subtopo{font-family:Arial, sans-serif; font-size:30px; font-weight:900; fill:white;}
+      .marca{font-family:Arial, sans-serif; font-size:42px; font-weight:900; fill:#747474; letter-spacing:1px;}
+      .titulo{font-family: Impact, 'Arial Black', Arial, sans-serif; font-weight:900; fill:#050505; letter-spacing:.5px;}
+      .spec{font-family:Arial, sans-serif; font-size:34px; font-weight:900; fill:#080808;}
+      .priceLabel{font-family:Arial, sans-serif; font-size:38px; font-weight:900; fill:#fff;}
+      .priceLabelRed{font-family:Arial, sans-serif; font-size:38px; font-weight:900; fill:#ff1018;}
+      .oldPrice{font-family:Arial, sans-serif; font-size:38px; font-weight:900; fill:#bfbfbf;}
+      .newPrice{font-family:Impact, 'Arial Black', Arial, sans-serif; font-size:68px; font-weight:900; fill:#ffd400; letter-spacing:1px;}
+      .smallBold{font-family:Arial, sans-serif; font-weight:900;}
+      .logoText{font-family:Arial, sans-serif; font-size:27px; font-weight:900; fill:white;}
+      .yellow{fill:#ffcc00;}
     </style>
   </defs>
 
   <rect width="1080" height="1350" fill="url(#bg)"/>
 
-  <!-- TOPO -->
-  <path d="M0 0 H820 L775 210 H0 Z" fill="#ffd100"/>
-  <circle cx="115" cy="100" r="78" fill="#050505" stroke="#ffd100" stroke-width="6"/>
-  <text x="115" y="88" text-anchor="middle" class="font" font-size="28" fill="#fff">PROMO</text>
-  <text x="115" y="126" text-anchor="middle" class="font" font-size="34" fill="#ffd100">TCHÊ</text>
-  <text x="115" y="150" text-anchor="middle" class="small" font-size="12" fill="#fff">OFERTAS TODOS OS DIAS!</text>
-  <text x="300" y="92" class="cond" font-size="72" fill="#050505" font-style="italic">PROMO TCHÊ</text>
-  <rect x="300" y="122" width="430" height="45" rx="22" fill="#050505"/>
-  <text x="515" y="153" text-anchor="middle" class="font" font-size="27" fill="#fff">OFERTAS TODOS OS DIAS!</text>
-  <path d="M820 0 H1080 V215 L950 175 L820 215 Z" fill="#e90012" filter="url(#shadow)"/>
-  <text x="950" y="82" text-anchor="middle" class="font" font-size="46" fill="#fff">OFERTA</text>
-  <text x="950" y="130" text-anchor="middle" class="font" font-size="42" fill="#ffd100">RELÂMPAGO</text>
+  <!-- Topo -->
+  <polygon points="0,0 815,0 775,210 0,210" fill="url(#yellow)"/>
+  ${logoSvg}
+  <text x="300" y="90" class="tituloTopo">PROMO TCHÊ</text>
+  <rect x="300" y="122" width="455" height="48" rx="24" fill="#070707"/>
+  <text x="527" y="155" text-anchor="middle" class="subtopo">OFERTAS TODOS OS DIAS!</text>
 
-  <!-- CARD BRANCO -->
-  <rect x="28" y="235" width="1024" height="850" rx="40" fill="#fff" filter="url(#shadow)"/>
-  <rect x="45" y="253" width="990" height="812" rx="32" fill="#fff" stroke="#ffd100" stroke-width="5"/>
+  <polygon points="820,0 1080,0 1080,215 950,175 820,215" fill="url(#red)" filter="url(#shadow)"/>
+  <text x="950" y="82" text-anchor="middle" class="smallBold" font-size="38" fill="#fff">OFERTA</text>
+  <text x="950" y="132" text-anchor="middle" class="smallBold" font-size="40" fill="#ffd400">RELÂMPAGO</text>
 
-  <!-- LADO TEXTO -->
-  <rect x="70" y="315" width="240" height="54" rx="10" fill="#ffd100"/>
-  <text x="190" y="354" text-anchor="middle" class="font" font-size="31" fill="#050505">${esc(categoria)}</text>
-  <text x="70" y="430" class="font" font-size="42" fill="#777">${esc(marca || 'PROMO TCHÊ')}</text>
+  <!-- Cartão branco -->
+  <rect x="30" y="235" width="1020" height="840" rx="38" fill="#fff" filter="url(#shadow)"/>
+  <rect x="48" y="252" width="984" height="804" rx="30" fill="none" stroke="#ffcc00" stroke-width="5"/>
+
+  <!-- Categoria -->
+  <rect x="70" y="315" width="240" height="58" rx="9" fill="#ffcc00"/>
+  <text x="190" y="355" text-anchor="middle" class="smallBold" font-size="34" fill="#050505">${esc(categoria)}</text>
+
+  <!-- Marca + título -->
+  <text x="70" y="435" class="marca">${esc(marca || 'OFERTA')}</text>
   ${tituloSvg}
-  <line x1="70" y1="680" x2="480" y2="680" stroke="#ffd100" stroke-width="6"/>
+
+  <!-- Separador + specs -->
+  <rect x="70" y="700" width="410" height="5" fill="#ffcc00"/>
   ${specsSvg}
 
-  <!-- DESCONTO -->
-  <circle cx="905" cy="350" r="75" fill="#11a832" stroke="#fff" stroke-width="11" filter="url(#shadow)"/>
-  <text x="905" y="332" text-anchor="middle" class="font" font-size="50" fill="#fff">${esc(desconto)}%</text>
-  <text x="905" y="387" text-anchor="middle" class="font" font-size="45" fill="#ffd100">OFF</text>
+  <!-- Imagem produto -->
+  <image href="${produtoImg}" x="600" y="350" width="365" height="495" preserveAspectRatio="xMidYMid meet"/>
 
-  <!-- FAIXA PRECO -->
-  <rect x="58" y="905" width="964" height="250" rx="28" fill="#050505"/>
-  <line x1="620" y1="930" x2="620" y2="1130" stroke="#777" stroke-width="2" stroke-dasharray="8 10"/>
-  <text x="90" y="970" class="font" font-size="38" fill="#fff">DE:</text>
-  <text x="205" y="970" class="font" font-size="43" fill="#aaa" text-decoration="line-through">${esc(precoAntigo)}</text>
-  <line x1="198" y1="955" x2="410" y2="925" stroke="#e90012" stroke-width="5"/>
-  <text x="90" y="1045" class="font" font-size="44" fill="#e90012">POR:</text>
-  <text x="220" y="1055" class="font" font-size="${precoSize}" fill="#ffd100">${esc(precoAtual)}</text>
-  <rect x="95" y="1088" width="445" height="68" rx="10" fill="#e90012"/>
-  <text x="318" y="1134" text-anchor="middle" class="font" font-size="35" fill="#ffd100">ECONOMIZE ${esc(economia)}</text>
-  <text x="820" y="965" text-anchor="middle" class="font" font-size="40" fill="#fff">USE O CUPOM:</text>
-  <rect x="680" y="1006" width="300" height="95" rx="16" fill="#e90012" stroke="#fff" stroke-width="4" stroke-dasharray="11 8"/>
-  <text x="830" y="1065" text-anchor="middle" class="font" font-size="${cupomSize}" fill="#ffd100">${esc(cupomText)}</text>
+  <!-- Selo desconto -->
+  ${desc ? `
+  <circle cx="905" cy="335" r="76" fill="white" filter="url(#shadow)"/>
+  <circle cx="905" cy="335" r="66" fill="url(#green)"/>
+  <text x="905" y="320" text-anchor="middle" class="smallBold" font-size="44" fill="#fff">${esc(desc)}%</text>
+  <text x="905" y="370" text-anchor="middle" class="smallBold" font-size="42" fill="#ffd400">OFF</text>` : ''}
 
-  <!-- RODAPE -->
-  <rect x="58" y="1192" width="610" height="70" rx="12" fill="#050505"/>
-  <text x="90" y="1238" class="font" font-size="34" fill="#fff">🔗 LINK NA BIO • OFERTAS TODOS OS DIAS</text>
-  <rect x="690" y="1192" width="332" height="70" rx="14" fill="#ffd100"/>
-  <text x="856" y="1221" text-anchor="middle" class="font" font-size="27" fill="#050505">CORRE QUE É</text>
-  <text x="856" y="1253" text-anchor="middle" class="font" font-size="27" fill="#050505">POR TEMPO LIMITADO!</text>
+  <!-- Bloco preço -->
+  <rect x="58" y="905" width="964" height="245" rx="24" fill="#030303"/>
+  <line x1="610" y1="930" x2="610" y2="1130" stroke="#d8d8d8" stroke-width="2" stroke-dasharray="8 9"/>
+
+  <text x="90" y="970" class="priceLabel">DE:</text>
+  <text x="210" y="970" class="oldPrice">${esc(precoAntigo)}</text>
+  <line x1="205" y1="950" x2="410" y2="925" stroke="#f20c18" stroke-width="5"/>
+  <text x="90" y="1045" class="priceLabelRed">POR:</text>
+  <text x="220" y="1055" class="newPrice">${esc(precoAtual)}</text>
+  <rect x="95" y="1088" width="435" height="62" rx="10" fill="url(#red)"/>
+  <text x="312" y="1129" text-anchor="middle" class="smallBold" font-size="31" fill="#ffd400">ECONOMIZE ${esc(econ)}</text>
+
+  <text x="805" y="965" text-anchor="middle" class="priceLabel">USE O CUPOM:</text>
+  <rect x="675" y="1008" width="300" height="90" rx="15" fill="url(#red)" stroke="#fff" stroke-width="4" stroke-dasharray="10 8"/>
+  <text x="825" y="1065" text-anchor="middle" class="smallBold" font-size="${cupom.font}" fill="#ffd400">${esc(cupom.texto)}</text>
+
+  <!-- Barras inferiores dentro do card -->
+  <rect x="60" y="1188" width="585" height="58" rx="9" fill="#030303"/>
+  <text x="352" y="1227" text-anchor="middle" class="smallBold" font-size="29" fill="#fff">LINK NA BIO • OFERTAS TODOS OS DIAS!</text>
+
+  <rect x="675" y="1188" width="345" height="58" rx="10" fill="#ffcc00"/>
+  <text x="847" y="1211" text-anchor="middle" class="smallBold" font-size="25" fill="#050505">CORRE QUE É</text>
+  <text x="847" y="1238" text-anchor="middle" class="smallBold" font-size="25" fill="#050505">POR TEMPO LIMITADO!</text>
 </svg>`;
-}
-
-async function gerarCard(dados, baseUrl = '') {
-  const categoria = normalizarCategoria(dados.categoria);
-  const marca = limpar(dados.marca).toUpperCase();
-  const tituloBase = limpar(dados.tituloCard) || limpar(dados.produto) || 'OFERTA PROMO TCHÊ';
-  const tituloSemMarca = marca ? tituloBase.replace(new RegExp(marca, 'ig'), '').trim() || tituloBase : tituloBase;
-  const tituloLinhas = quebrarTexto(tituloSemMarca.toUpperCase(), 16, 3);
-  const specs = extrairSpecs(dados);
-  const pa = moeda(dados.precoAntigo);
-  const pAtualNum = numero(dados.precoAtual);
-  const pAntigoNum = numero(dados.precoAntigo);
-  const pat = moeda(pAtualNum || dados.precoAtual);
-  const economia = pAntigoNum && pAtualNum ? moeda(pAntigoNum - pAtualNum) : '';
-  const desconto = limpar(dados.desconto) || (pAntigoNum && pAtualNum ? Math.round((1 - pAtualNum / pAntigoNum) * 100) : '');
-  const cupom = limpar(dados.cupom);
 
   const outDir = path.join(__dirname, '..', 'generated', 'cards');
   fs.mkdirSync(outDir, { recursive: true });
+  const outPath = path.join(outDir, nomeArquivo);
+  await sharp(Buffer.from(svg)).jpeg({ quality: 94 }).toFile(outPath);
 
-  const imgBuffer = await baixarImagem(dados.imagemProduto);
-  const produtoPng = await sharp(imgBuffer)
-    .resize(460, 460, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 0 } })
-    .png()
-    .toBuffer();
+  const urlBase = normalizarTexto(baseUrl).replace(/\/$/, '');
+  const publicUrl = urlBase ? `${urlBase}/cards/${nomeArquivo}` : `/cards/${nomeArquivo}`;
 
-  const svg = svgTemplate({ categoria, marca, tituloLinhas, specs, precoAntigo: pa, precoAtual: pat, economia, desconto, cupom });
-  const nome = `${Date.now()}-${slug(tituloBase)}.jpg`;
-  const caminho = path.join(outDir, nome);
-
-  await sharp(Buffer.from(svg))
-    .composite([{ input: produtoPng, left: 560, top: 380 }])
-    .jpeg({ quality: 92 })
-    .toFile(caminho);
-
-  const publicBase = limpar(baseUrl) || process.env.BASE_URL || '';
-  const imagemCard = publicBase ? `${publicBase.replace(/\/$/, '')}/cards/${nome}` : `/cards/${nome}`;
-  return { ok: true, imagemCard, arquivo: nome, caminho };
+  return {
+    ok: true,
+    imagemCard: publicUrl,
+    arquivo: nomeArquivo,
+    caminho: outPath,
+    categoriaDetectada: categoria.toLowerCase(),
+  };
 }
 
 module.exports = { gerarCard };
