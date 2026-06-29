@@ -6,7 +6,16 @@ const fs = require("fs");
 
 const WIDTH = 1080, HEIGHT = 1350;
 function esc(t=""){ return String(t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
-function moeda(v){ if(!v) return ""; const s=String(v).replace("R$","").trim(); return "R$ " + s; }
+function moeda(v) {
+  if (!v) return "";
+  let s = String(v).replace("=", "").replace("R$", "").trim();
+  let n = Number(s.replace(/\./g, "").replace(",", "."));
+  if (isNaN(n)) return "R$ " + s;
+  return n.toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL"
+  });
+}
 async function baixar(url){
   const r = await axios.get(url, {responseType:"arraybuffer", timeout:20000, headers:{"User-Agent":"Mozilla/5.0"}});
   return Buffer.from(r.data);
@@ -14,7 +23,7 @@ async function baixar(url){
 
 async function gerarCard({produto, precoAtual, precoAntigo, desconto, cupom, linkAfiliado, imagemProduto, outputPath}) {
   const logoPath = path.join(__dirname, "..", "assets", "logo-promotche.webp");
-  const productBuffer = await baixar(imagemProduto);
+  const productBuffer = await baixar(String(imagemProduto).replace("=", "").trim());
   const productImage = await sharp(productBuffer).resize(760,620,{fit:"contain",background:{r:255,g:255,b:255,alpha:0}}).png().toBuffer();
 
   let logoBuffer=null;
