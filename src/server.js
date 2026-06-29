@@ -26,5 +26,5 @@ app.post('/api/gerar-card', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PromoTche PRO v3 rodando em ${BASE_URL}`);
+  console.log(`PromoTche PRO v3 rodando em http://localhost:${PORT}`);
 });

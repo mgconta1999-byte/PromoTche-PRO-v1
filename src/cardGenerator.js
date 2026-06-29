@@ -1,275 +1,214 @@
 const fs = require('fs');
 const path = require('path');
-const sharp = require('sharp');
 const axios = require('axios');
+const sharp = require('sharp');
 
-const WIDTH = 1080;
-const HEIGHT = 1350;
+const W = 1080;
+const H = 1350;
 
 function limpar(v) {
   return String(v ?? '').replace(/^=/, '').trim();
 }
 
-function escapeXml(s) {
-  return limpar(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+function normalizarCategoria(v) {
+  const c = limpar(v).toLowerCase();
+  if (!c || c === 'generico' || c === 'genérico') return 'OFERTA';
+  if (c.includes('cel')) return 'CELULAR';
+  if (c.includes('smart')) return 'CELULAR';
+  if (c.includes('tv')) return 'TV';
+  if (c.includes('gel')) return 'GELADEIRA';
+  if (c.includes('note')) return 'NOTEBOOK';
+  if (c.includes('mov') || c.includes('móv') || c.includes('arm')) return 'MÓVEIS';
+  if (c.includes('eletro')) return 'ELETRO';
+  return c.toUpperCase();
 }
 
-function numeroBR(v) {
-  if (v === null || v === undefined || v === '') return null;
+function numero(v) {
   let s = limpar(v).replace(/R\$/gi, '').replace(/\s/g, '');
-  // Se vier 1.115,10 => 1115.10
+  if (!s) return 0;
   if (s.includes(',') && s.includes('.')) s = s.replace(/\./g, '').replace(',', '.');
-  // Se vier 1115,10 => 1115.10
   else if (s.includes(',')) s = s.replace(',', '.');
   const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) ? n : 0;
 }
 
 function moeda(v) {
-  const n = numeroBR(v);
-  if (n === null) return limpar(v).replace(/^R\$\s*/i, '');
-  return n.toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const n = typeof v === 'number' ? v : numero(v);
+  if (!n) return limpar(v) || 'R$ 0,00';
+  return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 }
 
-function moedaComRS(v) {
-  const m = moeda(v);
-  return m ? `R$ ${m}` : '';
-}
-
-function economia(precoAntigo, precoAtual) {
-  const antigo = numeroBR(precoAntigo);
-  const atual = numeroBR(precoAtual);
-  if (antigo === null || atual === null || antigo <= atual) return '';
-  return moedaComRS(antigo - atual);
-}
-
-function descontoTxt(desconto, precoAntigo, precoAtual) {
-  let d = limpar(desconto).replace('%', '');
-  if (!d) {
-    const antigo = numeroBR(precoAntigo);
-    const atual = numeroBR(precoAtual);
-    if (antigo && atual && antigo > atual) d = Math.round(((antigo - atual) / antigo) * 100);
-  }
-  return d ? `${d}%` : '';
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 }
 
 function slug(s) {
-  return limpar(s)
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 70) || 'card-promotche';
+  return limpar(s).toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'card';
 }
 
-function wrap(text, maxChars, maxLines = 3) {
-  const words = limpar(text).split(/\s+/).filter(Boolean);
-  const lines = [];
-  let line = '';
-  for (const word of words) {
-    const test = line ? `${line} ${word}` : word;
-    if (test.length <= maxChars) line = test;
+function quebrarTexto(texto, maxPorLinha = 17, maxLinhas = 3) {
+  const palavras = limpar(texto).split(/\s+/).filter(Boolean);
+  const linhas = [];
+  let atual = '';
+  for (const p of palavras) {
+    const teste = atual ? `${atual} ${p}` : p;
+    if (teste.length <= maxPorLinha) atual = teste;
     else {
-      if (line) lines.push(line);
-      line = word;
-      if (lines.length >= maxLines) break;
+      if (atual) linhas.push(atual);
+      atual = p;
     }
+    if (linhas.length === maxLinhas) break;
   }
-  if (line && lines.length < maxLines) lines.push(line);
-  if (words.length && lines.length === maxLines) {
-    const joined = lines.join(' ');
-    if (joined.length < words.join(' ').length) lines[maxLines - 1] = lines[maxLines - 1].replace(/\.*$/, '') + '...';
-  }
-  return lines;
+  if (linhas.length < maxLinhas && atual) linhas.push(atual);
+  if (linhas.length > maxLinhas) linhas.length = maxLinhas;
+  return linhas;
 }
 
-function categoriaNormalizada(categoria, produto = '') {
-  const c = limpar(categoria).toLowerCase();
-  const p = limpar(produto).toLowerCase();
-  const base = c || p;
-  if (!base) return 'oferta';
-  if (/celular|smartphone|iphone|galaxy|xiaomi|motorola|redmi/.test(base)) return 'celular';
-  if (/notebook|laptop|macbook/.test(base)) return 'notebook';
-  if (/tv|televis|smart tv/.test(base)) return 'tv';
-  if (/geladeira|refrigerador|frost/.test(base)) return 'geladeira';
-  if (/arm[aá]rio|guarda roupa|mesa|sof[aá]|cadeira|cama|m[oó]vel/.test(base)) return 'moveis';
-  return c ? c : 'oferta';
+function extrairSpecs(dados) {
+  const texto = `${limpar(dados.tituloCard)} ${limpar(dados.produto)}`.toLowerCase();
+  const specs = [];
+  const camera = texto.match(/(\d{2,3})\s*mp/);
+  const ram = texto.match(/(\d{1,2})\s*gb\s*ram/);
+  const armazenamento = texto.match(/(\d{2,4})\s*gb/) || texto.match(/(\d)\s*tb/);
+  const tela = texto.match(/(\d[\.,]\d)\s*("|pol|polegadas)/);
+  if (camera) specs.push(`Câmera de ${camera[1]}MP`);
+  if (ram && armazenamento) specs.push(`${ram[1]}GB RAM • ${armazenamento[1]}GB`);
+  else if (ram) specs.push(`${ram[1]}GB RAM`);
+  else if (armazenamento) specs.push(`${armazenamento[1]}GB`);
+  if (tela) specs.push(`Tela ${tela[1].replace('.', ',')}”`);
+  if (!specs.length) specs.push('Oferta por tempo limitado');
+  return specs.slice(0, 3);
 }
 
-function categoriaLabel(cat) {
-  const labels = {
-    celular: 'CELULAR',
-    notebook: 'NOTEBOOK',
-    tv: 'TV',
-    geladeira: 'GELADEIRA',
-    moveis: 'MÓVEIS',
-    oferta: 'OFERTA'
-  };
-  return labels[cat] || cat.toUpperCase();
-}
-
-function specs(produto, categoria) {
-  const p = limpar(produto);
-  const out = [];
-  if (categoria === 'celular') {
-    const ram = p.match(/(\d+)\s*(gb|g)\s*ram/i) || p.match(/(\d+)\s*(gb|g)\b/i);
-    const storage = p.match(/(\d+)\s*(gb|g|tb)\b/i);
-    const cam = p.match(/(\d+)\s*mp/i);
-    const tela = p.match(/(\d+[\.,]?\d*)\s*("|pol|polegadas)/i);
-    if (cam) out.push(`Câmera de ${cam[1]}MP`);
-    if (ram || storage) out.push(`${ram ? ram[1] + 'GB RAM' : 'Ótimo desempenho'}${storage ? ' • ' + storage[1] + storage[2].toUpperCase().replace('G','GB') : ''}`);
-    if (tela) out.push(`Tela ${tela[1].replace('.', ',')}”`);
-  }
-  if (categoria === 'geladeira') {
-    const litros = p.match(/(\d+)\s*l/i);
-    if (litros) out.push(`${litros[1]} litros`);
-    if (/frost free/i.test(p)) out.push('Frost Free');
-    if (/inverse/i.test(p)) out.push('Inverse');
-  }
-  if (categoria === 'tv') {
-    const pol = p.match(/(\d+)\s*("|pol|polegadas)/i);
-    if (pol) out.push(`${pol[1]} polegadas`);
-    if (/4k/i.test(p)) out.push('4K UHD');
-    if (/smart/i.test(p)) out.push('Smart TV');
-  }
-  if (out.length === 0) out.push('Oferta selecionada', 'Preço especial por tempo limitado');
-  return out.slice(0, 3);
-}
-
-async function baixar(url) {
-  const clean = limpar(url);
-  if (!clean || !/^https?:\/\//i.test(clean)) throw new Error(`ImagemProduto inválida: ${clean}`);
-  const r = await axios.get(clean, {
+async function baixarImagem(url) {
+  const u = limpar(url);
+  if (!u || !/^https?:\/\//i.test(u)) throw new Error(`ImagemProduto inválida: ${u}`);
+  const r = await axios.get(u, {
     responseType: 'arraybuffer',
     timeout: 25000,
-    headers: { 'User-Agent': 'Mozilla/5.0 PromoTcheBot/3.0' }
+    headers: { 'User-Agent': 'Mozilla/5.0 PromoTche/3.0' }
   });
   return Buffer.from(r.data);
 }
 
-async function gerarCard(dados = {}, baseUrl = '') {
-  const produtoOriginal = limpar(dados.produto);
-  const titulo = limpar(dados.tituloCard) || produtoOriginal || 'Oferta Promo Tchê';
-  const marca = limpar(dados.marca);
-  const cat = categoriaNormalizada(dados.categoria, produtoOriginal);
-  const label = categoriaLabel(cat);
-  const precoAtual = moeda(dados.precoAtual);
-  const precoAntigo = moeda(dados.precoAntigo);
-  const cupom = limpar(dados.cupom);
-  const desc = descontoTxt(dados.desconto, dados.precoAntigo, dados.precoAtual);
-  const econ = economia(dados.precoAntigo, dados.precoAtual);
-  const detalhes = specs(produtoOriginal || titulo, cat);
+function fitText(text, maxChars, baseSize) {
+  const len = limpar(text).length;
+  if (len <= maxChars) return baseSize;
+  return Math.max(36, Math.floor(baseSize * maxChars / len));
+}
 
-  const safeBase = limpar(baseUrl || process.env.BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+function svgTemplate({ categoria, marca, tituloLinhas, specs, precoAntigo, precoAtual, economia, desconto, cupom }) {
+  const tituloSvg = tituloLinhas.map((l, i) => `<text x="70" y="${505 + i * 70}" class="titulo">${esc(l)}</text>`).join('\n');
+  const specsSvg = specs.map((s, i) => `<text x="96" y="${745 + i * 60}" class="spec">${esc(s)}</text><circle cx="75" cy="${733 + i * 60}" r="7" fill="#f4c400"/>`).join('\n');
+  const cupomText = limpar(cupom) || 'CONFIRA NO LINK';
+  const cupomSize = fitText(cupomText, 16, 42);
+  const precoSize = fitText(precoAtual, 11, 72);
+
+  return `
+<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#070707"/><stop offset="0.58" stop-color="#080808"/><stop offset="1" stop-color="#ffcc00"/></linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%"><feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity="0.35"/></filter>
+    <style>
+      .font{font-family:Arial, Helvetica, sans-serif;font-weight:900;}
+      .cond{font-family:Arial Narrow, Arial, Helvetica, sans-serif;font-weight:900;}
+      .small{font-family:Arial, Helvetica, sans-serif;font-weight:700;}
+      .titulo{font-family:Arial Narrow, Arial, Helvetica, sans-serif;font-weight:900;font-size:58px;fill:#070707;letter-spacing:-1px;}
+      .spec{font-family:Arial, Helvetica, sans-serif;font-weight:800;font-size:34px;fill:#111;}
+    </style>
+  </defs>
+
+  <rect width="1080" height="1350" fill="url(#bg)"/>
+
+  <!-- TOPO -->
+  <path d="M0 0 H820 L775 210 H0 Z" fill="#ffd100"/>
+  <circle cx="115" cy="100" r="78" fill="#050505" stroke="#ffd100" stroke-width="6"/>
+  <text x="115" y="88" text-anchor="middle" class="font" font-size="28" fill="#fff">PROMO</text>
+  <text x="115" y="126" text-anchor="middle" class="font" font-size="34" fill="#ffd100">TCHÊ</text>
+  <text x="115" y="150" text-anchor="middle" class="small" font-size="12" fill="#fff">OFERTAS TODOS OS DIAS!</text>
+  <text x="300" y="92" class="cond" font-size="72" fill="#050505" font-style="italic">PROMO TCHÊ</text>
+  <rect x="300" y="122" width="430" height="45" rx="22" fill="#050505"/>
+  <text x="515" y="153" text-anchor="middle" class="font" font-size="27" fill="#fff">OFERTAS TODOS OS DIAS!</text>
+  <path d="M820 0 H1080 V215 L950 175 L820 215 Z" fill="#e90012" filter="url(#shadow)"/>
+  <text x="950" y="82" text-anchor="middle" class="font" font-size="46" fill="#fff">OFERTA</text>
+  <text x="950" y="130" text-anchor="middle" class="font" font-size="42" fill="#ffd100">RELÂMPAGO</text>
+
+  <!-- CARD BRANCO -->
+  <rect x="28" y="235" width="1024" height="850" rx="40" fill="#fff" filter="url(#shadow)"/>
+  <rect x="45" y="253" width="990" height="812" rx="32" fill="#fff" stroke="#ffd100" stroke-width="5"/>
+
+  <!-- LADO TEXTO -->
+  <rect x="70" y="315" width="240" height="54" rx="10" fill="#ffd100"/>
+  <text x="190" y="354" text-anchor="middle" class="font" font-size="31" fill="#050505">${esc(categoria)}</text>
+  <text x="70" y="430" class="font" font-size="42" fill="#777">${esc(marca || 'PROMO TCHÊ')}</text>
+  ${tituloSvg}
+  <line x1="70" y1="680" x2="480" y2="680" stroke="#ffd100" stroke-width="6"/>
+  ${specsSvg}
+
+  <!-- DESCONTO -->
+  <circle cx="905" cy="350" r="75" fill="#11a832" stroke="#fff" stroke-width="11" filter="url(#shadow)"/>
+  <text x="905" y="332" text-anchor="middle" class="font" font-size="50" fill="#fff">${esc(desconto)}%</text>
+  <text x="905" y="387" text-anchor="middle" class="font" font-size="45" fill="#ffd100">OFF</text>
+
+  <!-- FAIXA PRECO -->
+  <rect x="58" y="905" width="964" height="250" rx="28" fill="#050505"/>
+  <line x1="620" y1="930" x2="620" y2="1130" stroke="#777" stroke-width="2" stroke-dasharray="8 10"/>
+  <text x="90" y="970" class="font" font-size="38" fill="#fff">DE:</text>
+  <text x="205" y="970" class="font" font-size="43" fill="#aaa" text-decoration="line-through">${esc(precoAntigo)}</text>
+  <line x1="198" y1="955" x2="410" y2="925" stroke="#e90012" stroke-width="5"/>
+  <text x="90" y="1045" class="font" font-size="44" fill="#e90012">POR:</text>
+  <text x="220" y="1055" class="font" font-size="${precoSize}" fill="#ffd100">${esc(precoAtual)}</text>
+  <rect x="95" y="1088" width="445" height="68" rx="10" fill="#e90012"/>
+  <text x="318" y="1134" text-anchor="middle" class="font" font-size="35" fill="#ffd100">ECONOMIZE ${esc(economia)}</text>
+  <text x="820" y="965" text-anchor="middle" class="font" font-size="40" fill="#fff">USE O CUPOM:</text>
+  <rect x="680" y="1006" width="300" height="95" rx="16" fill="#e90012" stroke="#fff" stroke-width="4" stroke-dasharray="11 8"/>
+  <text x="830" y="1065" text-anchor="middle" class="font" font-size="${cupomSize}" fill="#ffd100">${esc(cupomText)}</text>
+
+  <!-- RODAPE -->
+  <rect x="58" y="1192" width="610" height="70" rx="12" fill="#050505"/>
+  <text x="90" y="1238" class="font" font-size="34" fill="#fff">🔗 LINK NA BIO • OFERTAS TODOS OS DIAS</text>
+  <rect x="690" y="1192" width="332" height="70" rx="14" fill="#ffd100"/>
+  <text x="856" y="1221" text-anchor="middle" class="font" font-size="27" fill="#050505">CORRE QUE É</text>
+  <text x="856" y="1253" text-anchor="middle" class="font" font-size="27" fill="#050505">POR TEMPO LIMITADO!</text>
+</svg>`;
+}
+
+async function gerarCard(dados, baseUrl = '') {
+  const categoria = normalizarCategoria(dados.categoria);
+  const marca = limpar(dados.marca).toUpperCase();
+  const tituloBase = limpar(dados.tituloCard) || limpar(dados.produto) || 'OFERTA PROMO TCHÊ';
+  const tituloSemMarca = marca ? tituloBase.replace(new RegExp(marca, 'ig'), '').trim() || tituloBase : tituloBase;
+  const tituloLinhas = quebrarTexto(tituloSemMarca.toUpperCase(), 16, 3);
+  const specs = extrairSpecs(dados);
+  const pa = moeda(dados.precoAntigo);
+  const pAtualNum = numero(dados.precoAtual);
+  const pAntigoNum = numero(dados.precoAntigo);
+  const pat = moeda(pAtualNum || dados.precoAtual);
+  const economia = pAntigoNum && pAtualNum ? moeda(pAntigoNum - pAtualNum) : '';
+  const desconto = limpar(dados.desconto) || (pAntigoNum && pAtualNum ? Math.round((1 - pAtualNum / pAntigoNum) * 100) : '');
+  const cupom = limpar(dados.cupom);
+
   const outDir = path.join(__dirname, '..', 'generated', 'cards');
   fs.mkdirSync(outDir, { recursive: true });
-  const arquivo = `${Date.now()}-${slug(titulo)}.jpg`;
-  const caminho = path.join(outDir, arquivo);
 
-  const productBuffer = await baixar(dados.imagemProduto);
-  const productImage = await sharp(productBuffer)
-    .resize(430, 550, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 0 } })
+  const imgBuffer = await baixarImagem(dados.imagemProduto);
+  const produtoPng = await sharp(imgBuffer)
+    .resize(460, 460, { fit: 'contain', background: { r: 255, g: 255, b: 255, alpha: 0 } })
     .png()
     .toBuffer();
 
-  let logoBuffer = null;
-  const logoCandidates = [
-    path.join(__dirname, 'assets', 'logo-promotche.webp'),
-    path.join(__dirname, 'assets', 'logo.webp'),
-    path.join(__dirname, '..', 'assets', 'logo-promotche.webp'),
-    path.join(__dirname, '..', 'assets', 'logo.webp')
-  ];
-  for (const p of logoCandidates) {
-    if (fs.existsSync(p)) {
-      logoBuffer = await sharp(p).resize(170, 170, { fit: 'contain' }).png().toBuffer();
-      break;
-    }
-  }
-
-  const titleLines = wrap(titulo.toUpperCase(), 17, 3);
-  const titleSvg = titleLines.map((l, i) =>
-    `<text x="70" y="${470 + i * 62}" font-size="56" font-weight="900" font-family="Arial Black, Impact, Arial" fill="#050505">${escapeXml(l)}</text>`
-  ).join('');
-
-  const detailsSvg = detalhes.map((d, i) =>
-    `<text x="95" y="${760 + i * 52}" font-size="30" font-weight="700" font-family="Arial" fill="#111">• ${escapeXml(d)}</text>`
-  ).join('');
-
-  const logoFallback = logoBuffer ? '' : `
-    <circle cx="104" cy="105" r="78" fill="#050505" stroke="#ffcc00" stroke-width="5"/>
-    <text x="104" y="93" text-anchor="middle" font-size="28" font-weight="900" fill="#fff" font-family="Arial Black">PROMO</text>
-    <text x="104" y="128" text-anchor="middle" font-size="30" font-weight="900" fill="#ffcc00" font-family="Arial Black">TCHÊ</text>`;
-
-  const svg = `
-  <svg width="${WIDTH}" height="${HEIGHT}" viewBox="0 0 ${WIDTH} ${HEIGHT}" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-      <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#050505"/><stop offset="0.52" stop-color="#101010"/><stop offset="1" stop-color="#ffcc00"/></linearGradient>
-      <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#000" flood-opacity="0.35"/></filter>
-      <filter id="soft" x="-20%" y="-20%" width="140%" height="140%"><feDropShadow dx="0" dy="5" stdDeviation="8" flood-color="#000" flood-opacity="0.22"/></filter>
-    </defs>
-
-    <rect width="1080" height="1350" fill="url(#bg)"/>
-    <path d="M190 0 H825 L790 205 H0 V0 Z" fill="#ffcc00"/>
-    <rect x="835" y="0" width="245" height="225" fill="#e50914"/>
-    <path d="M835 225 L957 185 L1080 225 Z" fill="#c8000d"/>
-    ${logoFallback}
-    <text x="520" y="91" text-anchor="middle" font-size="64" font-weight="900" font-style="italic" font-family="Arial Black, Impact" fill="#050505">PROMO TCHÊ</text>
-    <rect x="300" y="118" width="450" height="43" rx="22" fill="#050505"/>
-    <text x="525" y="148" text-anchor="middle" font-size="25" font-weight="800" font-family="Arial" fill="#fff">OFERTAS TODOS OS DIAS!</text>
-    <text x="957" y="84" text-anchor="middle" font-size="42" font-weight="900" fill="#fff" font-family="Arial Black">OFERTA</text>
-    <text x="957" y="135" text-anchor="middle" font-size="38" font-weight="900" fill="#ffcc00" font-family="Arial Black">RELÂMPAGO</text>
-
-    <rect x="28" y="242" width="1024" height="900" rx="36" fill="#fff" stroke="#ffcc00" stroke-width="6" filter="url(#soft)"/>
-    <rect x="50" y="264" width="980" height="856" rx="28" fill="#fff" stroke="#eee" stroke-width="2"/>
-
-    <rect x="70" y="315" width="235" height="58" rx="10" fill="#ffcc00"/>
-    <text x="187" y="355" text-anchor="middle" font-size="33" font-weight="900" font-family="Arial Black" fill="#050505">${escapeXml(label)}</text>
-    <text x="70" y="430" font-size="40" font-weight="900" font-family="Arial Black" fill="#777">${escapeXml(marca.toUpperCase())}</text>
-    ${titleSvg}
-    <line x1="70" y1="705" x2="455" y2="705" stroke="#ffcc00" stroke-width="6"/>
-    ${detailsSvg}
-
-    <circle cx="900" cy="343" r="82" fill="#08a826" stroke="#fff" stroke-width="10" filter="url(#shadow)"/>
-    <text x="900" y="330" text-anchor="middle" font-size="50" font-weight="900" font-family="Arial Black" fill="#fff">${escapeXml(desc || 'OFF')}</text>
-    <text x="900" y="386" text-anchor="middle" font-size="44" font-weight="900" font-family="Arial Black" fill="#ffdf00">OFF</text>
-
-    <rect x="66" y="948" width="948" height="240" rx="24" fill="#050505"/>
-    <line x1="575" y1="980" x2="575" y2="1155" stroke="#777" stroke-width="2" stroke-dasharray="7 10"/>
-    <text x="105" y="1015" font-size="34" font-weight="900" font-family="Arial Black" fill="#fff">DE:</text>
-    <text x="210" y="1015" font-size="36" font-weight="900" font-family="Arial Black" fill="#bbb" text-decoration="line-through">R$ ${escapeXml(precoAntigo)}</text>
-    <text x="105" y="1090" font-size="36" font-weight="900" font-family="Arial Black" fill="#ff1b1b">POR:</text>
-    <text x="210" y="1102" font-size="64" font-weight="900" font-family="Arial Black, Impact" fill="#ffcc00">R$ ${escapeXml(precoAtual)}</text>
-    <rect x="98" y="1128" width="425" height="55" rx="10" fill="#e50914"/>
-    <text x="310" y="1166" text-anchor="middle" font-size="31" font-weight="900" font-family="Arial Black" fill="#ffdf00">ECONOMIZE ${escapeXml(econ)}</text>
-
-    <text x="782" y="1018" text-anchor="middle" font-size="35" font-weight="900" font-family="Arial Black" fill="#fff">USE O CUPOM:</text>
-    <rect x="645" y="1058" width="285" height="90" rx="14" fill="#e50914" stroke="#fff" stroke-width="4" stroke-dasharray="10 7"/>
-    <text x="787" y="1115" text-anchor="middle" font-size="31" font-weight="900" font-family="Arial Black" fill="#ffdf00">${escapeXml(cupom || 'CONFIRA')}</text>
-
-    <rect x="70" y="1230" width="610" height="55" rx="17" fill="#050505" filter="url(#soft)"/>
-    <text x="375" y="1267" text-anchor="middle" font-size="31" font-weight="900" font-family="Arial Black" fill="#fff">🔗 LINK NA BIO • OFERTAS TODOS OS DIAS</text>
-    <rect x="700" y="1218" width="300" height="78" rx="16" fill="#ffcc00"/>
-    <text x="850" y="1250" text-anchor="middle" font-size="28" font-weight="900" font-family="Arial Black" fill="#050505">CORRE QUE É</text>
-    <text x="850" y="1282" text-anchor="middle" font-size="26" font-weight="900" font-family="Arial Black" fill="#050505">POR TEMPO LIMITADO!</text>
-  </svg>`;
-
-  const composites = [
-    { input: productImage, left: 560, top: 375 }
-  ];
-  if (logoBuffer) composites.push({ input: logoBuffer, left: 28, top: 24 });
+  const svg = svgTemplate({ categoria, marca, tituloLinhas, specs, precoAntigo: pa, precoAtual: pat, economia, desconto, cupom });
+  const nome = `${Date.now()}-${slug(tituloBase)}.jpg`;
+  const caminho = path.join(outDir, nome);
 
   await sharp(Buffer.from(svg))
-    .composite(composites)
-    .jpeg({ quality: 94 })
+    .composite([{ input: produtoPng, left: 560, top: 380 }])
+    .jpeg({ quality: 92 })
     .toFile(caminho);
 
-  const imagemCard = `${safeBase}/cards/${arquivo}`;
-  return { ok: true, imagemCard, arquivo, caminho, categoriaDetectada: cat };
+  const publicBase = limpar(baseUrl) || process.env.BASE_URL || '';
+  const imagemCard = publicBase ? `${publicBase.replace(/\/$/, '')}/cards/${nome}` : `/cards/${nome}`;
+  return { ok: true, imagemCard, arquivo: nome, caminho };
 }
 
 module.exports = { gerarCard };
